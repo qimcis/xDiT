@@ -147,15 +147,30 @@ class DiTRuntimeState(RuntimeState):
                 * pipeline.transformer.config.attention_head_dim,
             )
         else:
-            vae_scale_factor = pipeline.vae_scale_factor
-            if pipeline.__class__.__name__.startswith("Flux") and diffusers.__version__ >= '0.32':
-                vae_scale_factor *= 2
+            vae_scale_factor = getattr(pipeline, "vae_scale_factor", None)
+            vae_scale_factor_spatial = getattr(pipeline, "vae_scale_factor_spatial", None)
+            vae_scale_factor_temporal = getattr(pipeline, "vae_scale_factor_temporal", None)
+            if pipeline.__class__.__name__.startswith("Flux") and diffusers.__version__ >= "0.32":
+                if vae_scale_factor is not None:
+                    vae_scale_factor *= 2
+                if vae_scale_factor_spatial is not None:
+                    vae_scale_factor_spatial *= 2
+
+            if vae_scale_factor is None:
+                vae_scale_factor = vae_scale_factor_spatial
+            if vae_scale_factor is None:
+                raise AttributeError(
+                    f"{pipeline.__class__.__name__} does not expose a vae scale factor attribute."
+                )
+
             self._set_model_parameters(
                 vae_scale_factor=vae_scale_factor,
                 backbone_patch_size=pipeline.transformer.config.patch_size,
                 backbone_in_channel=pipeline.transformer.config.in_channels,
                 backbone_inner_dim=pipeline.transformer.config.num_attention_heads
                 * pipeline.transformer.config.attention_head_dim,
+                vae_scale_factor_spatial=vae_scale_factor_spatial,
+                vae_scale_factor_temporal=vae_scale_factor_temporal,
             )
 
     def set_input_parameters(
@@ -261,14 +276,22 @@ class DiTRuntimeState(RuntimeState):
     def _set_model_parameters(
         self,
         vae_scale_factor: int,
-        backbone_patch_size: int,
+        backbone_patch_size,
         backbone_inner_dim: int,
         backbone_in_channel: int,
+        *,
+        vae_scale_factor_spatial: Optional[int] = None,
+        vae_scale_factor_temporal: Optional[int] = None,
     ):
         self.vae_scale_factor = vae_scale_factor
-        self.backbone_patch_size = backbone_patch_size
+        if isinstance(backbone_patch_size, (list, tuple)):
+            self.backbone_patch_size = backbone_patch_size[-1]
+        else:
+            self.backbone_patch_size = backbone_patch_size
         self.backbone_inner_dim = backbone_inner_dim
         self.backbone_in_channel = backbone_in_channel
+        self.vae_scale_factor_spatial = vae_scale_factor_spatial or vae_scale_factor
+        self.vae_scale_factor_temporal = vae_scale_factor_temporal or 1
 
     def _input_size_change(
         self,
@@ -680,4 +703,3 @@ def initialize_runtime_state(pipeline: DiffusionPipeline, engine_config: EngineC
         _RUNTIME = DiTRuntimeState(pipeline=pipeline, config=engine_config)
     elif hasattr(pipeline, "unet"):
         _RUNTIME = UnetRuntimeState(pipeline=pipeline, config=engine_config)
-
