@@ -9,9 +9,25 @@ import os
 from typing import Any, Dict, Iterable
 
 import torch
+import warnings
 
 from xfuser import xFuserFastWanSRPipeline
 from xfuser.config.args import FlexibleArgumentParser, xFuserArgs
+
+# Optionally enable FastVideo’s custom diffusers patches if available.
+_FASTVIDEO_PATCH_LOADED = False
+try:
+    import fastvideo.diffusers_patch  # type: ignore  # noqa: F401
+
+    _FASTVIDEO_PATCH_LOADED = True
+except ImportError:
+    warnings.warn(
+        "fastvideo.diffusers_patch not found. FastWan checkpoints may load with missing weights.\n"
+        "Install FastVideo (git clone https://github.com/hao-ai-lab/FastVideo && pip install -e .) "
+        "and ensure it is on PYTHONPATH, then re-run with --trust_remote_code."
+    )
+else:
+    print("FastVideo diffusers patches loaded.")
 
 
 def _normalize_prompt(value: Any) -> Any:
@@ -88,12 +104,38 @@ def _save_output(result: Any, output_path: str) -> None:
 
     if _has_media(data, "frames"):
         frames_list = _ensure_iterable(data["frames"])
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        base_dir = os.path.dirname(output_path) or "."
+        os.makedirs(base_dir, exist_ok=True)
         for idx, frames in enumerate(frames_list):
+            print(f"Processing frames[{idx}] type={type(frames)}")
             suffix = "" if idx == 0 else f"_{idx}"
-            tensor_path = f"{os.path.splitext(_add_suffix(output_path, suffix))[0]}_frames.pt"
-            torch.save(frames, tensor_path)
-            print(f"Video frames tensor saved to {tensor_path} (convert to MP4 as needed).")
+            stem = os.path.splitext(_add_suffix(output_path, suffix))[0]
+
+            if isinstance(frames, torch.Tensor):
+                tensor_path = f"{stem}_frames.pt"
+                torch.save(frames, tensor_path)
+                print(f"Video frames tensor saved to {tensor_path} (convert to MP4 as needed).")
+                continue
+
+            if isinstance(frames, (list, tuple)):
+                if frames:
+                    print(f"frames[{idx}][0] type={type(frames[0])}")
+                if frames and hasattr(frames[0], "save"):
+                    frame_dir = f"{stem}_frames"
+                    os.makedirs(frame_dir, exist_ok=True)
+                    for frame_idx, frame in enumerate(frames):
+                        frame_path = os.path.join(frame_dir, f"frame_{frame_idx:05d}.png")
+                        frame.save(frame_path)
+                    print(f"Saved {len(frames)} frames to directory {frame_dir}")
+                    continue
+
+                if frames and isinstance(frames[0], torch.Tensor):
+                    tensor_path = f"{stem}_frames.pt"
+                    torch.save(torch.stack([f.detach().cpu() for f in frames]), tensor_path)
+                    print(f"Video frames tensor list saved to {tensor_path} (convert to MP4 as needed).")
+                    continue
+
+            print("Unsupported frame data type; nothing saved for frames.")
         return
 
     if _has_media(data, "videos"):
