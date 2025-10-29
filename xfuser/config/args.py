@@ -62,6 +62,12 @@ class xFuserArgs:
     model: str
     download_dir: Optional[str] = None
     trust_remote_code: bool = False
+    rendering_model_path: Optional[str] = None
+    sr_diff_threshold: float = 0.01
+    sr_min_switch_step: int = 5
+    sr_max_switch_step: int = 30
+    sr_render_offload: bool = False
+    sr_lazy_move_render: bool = True
     # Runtime arguments
     warmup_steps: int = 1
     # use_cuda_graph: bool = True
@@ -138,6 +144,45 @@ class xFuserArgs:
             action="store_true",
             help="Trust remote code from huggingface.",
         )
+
+        model_group.add_argument(
+            "--rendering_model_path",
+            type=nullable_str,
+            default=xFuserArgs.rendering_model_path,
+            help="Optional path to the FastWan rendering checkpoint (1.3B).",
+        )
+
+        sr_group = parser.add_argument_group("Sketch-Render Options")
+        sr_group.add_argument(
+            "--sr_diff_threshold",
+            type=float,
+            default=xFuserArgs.sr_diff_threshold,
+            help="Self-diff threshold for switching to the rendering model.",
+        )
+        sr_group.add_argument(
+            "--sr_min_switch_step",
+            type=int,
+            default=xFuserArgs.sr_min_switch_step,
+            help="Minimum denoising step before the switch can trigger.",
+        )
+        sr_group.add_argument(
+            "--sr_max_switch_step",
+            type=int,
+            default=xFuserArgs.sr_max_switch_step,
+            help="Force a switch once this denoising step is reached.",
+        )
+        sr_group.add_argument(
+            "--sr_render_offload",
+            action="store_true",
+            help="Offload the sketching transformer to CPU after switching.",
+        )
+        sr_group.add_argument(
+            "--sr_eager_render_load",
+            dest="sr_lazy_move_render",
+            action="store_false",
+            help="Load the rendering transformer to GPU during init instead of on switch.",
+        )
+        parser.set_defaults(sr_lazy_move_render=xFuserArgs.sr_lazy_move_render)
 
         # Runtime arguments
         runtime_group = parser.add_argument_group("Runtime Options")

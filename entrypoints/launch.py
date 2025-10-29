@@ -80,7 +80,10 @@ class ImageGenerator:
             "HunyuanDiT-v1.2-Diffusers": xFuserHunyuanDiTPipeline,
             "FLUX.1-schnell": xFuserFluxPipeline,
             "FLUX.1-dev": xFuserFluxPipeline,
+            "FastWan2.1-T2V-14B-Diffusers": xFuserFastWanSRPipeline,
+            "FastWan2.1-T2V-1.3B-Diffusers": xFuserFastWanSRPipeline,
         }
+
         
         PipelineClass = pipeline_map.get(model_name)
         if PipelineClass is None:
@@ -88,11 +91,25 @@ class ImageGenerator:
 
         self.logger.info(f"Initializing model {model_name} from {xfuser_args.model}")
 
-        self.pipe = PipelineClass.from_pretrained(
-            pretrained_model_name_or_path=xfuser_args.model,
-            engine_config=self.engine_config,
-            torch_dtype=torch.float16,
-        ).to("cuda")
+        pipeline_kwargs = {
+            "pretrained_model_name_or_path": xfuser_args.model,
+            "engine_config": self.engine_config,
+            "torch_dtype": torch.float16,
+        }
+        if PipelineClass is xFuserFastWanSRPipeline:
+            if xfuser_args.rendering_model_path is None:
+                raise ValueError(
+                    "FastWan sketch-render mode requires --rendering-model-path pointing to the 1.3B checkpoint."
+                )
+            pipeline_kwargs.update(
+                rendering_model_path=xfuser_args.rendering_model_path,
+                self_diff_threshold=xfuser_args.sr_diff_threshold,
+                min_switch_step=xfuser_args.sr_min_switch_step,
+                max_switch_step=xfuser_args.sr_max_switch_step,
+                render_offload=xfuser_args.sr_render_offload,
+                lazy_move_render=xfuser_args.sr_lazy_move_render,
+            )
+        self.pipe = PipelineClass.from_pretrained(**pipeline_kwargs).to("cuda")
         
         self.pipe.prepare_run(self.input_config)
         self.logger.info("Model initialization completed")
