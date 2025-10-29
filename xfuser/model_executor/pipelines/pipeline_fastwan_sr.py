@@ -180,7 +180,9 @@ class xFuserFastWanSRPipeline(xFuserPipelineBaseWrapper):
             raise ValueError("`rendering_model_path` must be provided for sketch-render inference.")
 
         pipeline = DiffusionPipeline.from_pretrained(
-            pretrained_model_name_or_path, **kwargs
+            pretrained_model_name_or_path,
+            trust_remote_code=engine_config.model_config.trust_remote_code,
+            **kwargs,
         )
         if return_org_pipeline:
             return pipeline
