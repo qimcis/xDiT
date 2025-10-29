@@ -140,7 +140,7 @@ class xFuserArgs:
             help="Directory to download and load the weights, default to the default cache dir of huggingface.",
         )
         model_group.add_argument(
-            "--trust-remote-code",
+            "--trust_remote_code",
             action="store_true",
             help="Trust remote code from huggingface.",
         )
