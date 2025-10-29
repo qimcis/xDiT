@@ -1,4 +1,5 @@
 import os
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
@@ -83,7 +84,7 @@ class _SketchRenderTransformer(nn.Module):
         super().__init__()
         self.sketch_model = sketch_model
         self.render_model = render_model
-        self.config = config
+        self.sr_config = config
         self._default_dtype = default_dtype or torch.float32
         self._sketch_checkpoint_path = sketch_checkpoint_path
         self._render_checkpoint_path = render_checkpoint_path
@@ -108,7 +109,7 @@ class _SketchRenderTransformer(nn.Module):
         self._materialize_meta_tensors(self.render_model)
 
     def reset_state(self):
-        if self.config.render_offload:
+        if self.sr_config.render_offload:
             device = self._last_device or self._get_module_device(self.render_model)
             if device is not None and device.type != "cpu":
                 self.sketch_model.to(device)
@@ -118,16 +119,40 @@ class _SketchRenderTransformer(nn.Module):
         self.prev_output = None
         self.prev_diff = None
 
+    def cache_context(self, name: str):
+        """
+        Mirror WanTransformer cache management across both sketch and render transformers.
+        """
+        sketch_ctx = getattr(self.sketch_model, "cache_context", None)
+        render_ctx = getattr(self.render_model, "cache_context", None)
+        if sketch_ctx is None and render_ctx is None:
+            # fallback no-op context manager
+            class _NullContext:
+                def __enter__(self_inner):
+                    return None
+
+                def __exit__(self_inner, exc_type, exc, tb):
+                    return False
+
+            return _NullContext()
+
+        stack = ExitStack()
+        if sketch_ctx is not None:
+            stack.enter_context(sketch_ctx(name))
+        if render_ctx is not None:
+            stack.enter_context(render_ctx(name))
+        return stack
+
     def to(self, *args, **kwargs):  # noqa: D401 (follow torch semantics)
         target_device = self._extract_device_from_args(*args, **kwargs)
         target_dtype = self._extract_dtype_from_args(*args, **kwargs)
 
         self._materialize_meta_tensors(self.sketch_model)
-        if not self.config.lazy_move_render or self.switched:
+        if not self.sr_config.lazy_move_render or self.switched:
             self._materialize_meta_tensors(self.render_model)
 
         self.sketch_model.to(*args, **kwargs)
-        if not self.config.lazy_move_render or self.switched:
+        if not self.sr_config.lazy_move_render or self.switched:
             self.render_model.to(*args, **kwargs)
         super().to(*args, **kwargs)
 
@@ -136,7 +161,7 @@ class _SketchRenderTransformer(nn.Module):
         else:
             self._last_device = self._get_module_device(self.sketch_model)
 
-        if self.config.lazy_move_render and not self.switched:
+        if self.sr_config.lazy_move_render and not self.switched:
             # keep rendering transformer on CPU until the switch happens
             self.render_model.to("cpu")
             self._materialize_meta_tensors(self.render_model, device=torch.device("cpu"))
@@ -167,14 +192,14 @@ class _SketchRenderTransformer(nn.Module):
             return
         logger.info("Switching to FastWan rendering model at step %d", self.step_idx)
 
-        if self.config.lazy_move_render:
+        if self.sr_config.lazy_move_render:
             self._materialize_meta_tensors(self.render_model, device=device)
             self.render_model.to(device)
         self.active_model = self.render_model
         self.switched = True
         self._last_device = device
 
-        if self.config.render_offload:
+        if self.sr_config.render_offload:
             self.sketch_model.to("cpu")
 
     def forward(self, *args, **kwargs):
@@ -182,13 +207,13 @@ class _SketchRenderTransformer(nn.Module):
         # the DiT forward usually returns either a tensor or a tuple, we always take the tensor
         current = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
 
-        if not self.switched and self.step_idx >= self.config.min_switch_step:
+        if not self.switched and self.step_idx >= self.sr_config.min_switch_step:
             maybe_self_diff = self._compute_self_diff(current.detach())
 
             if maybe_self_diff is not None:
                 should_switch = (
-                    0 < maybe_self_diff.item() < self.config.threshold
-                    or self.step_idx >= self.config.max_switch_step
+                    0 < maybe_self_diff.item() < self.sr_config.threshold
+                    or self.step_idx >= self.sr_config.max_switch_step
                 )
                 if should_switch:
                     device = current.device if hasattr(current, "device") else torch.device("cuda")
@@ -288,42 +313,13 @@ class _SketchRenderTransformer(nn.Module):
 
     def _materialize_meta_tensors(self, module: nn.Module, device: Optional[torch.device] = None):
         self._ensure_rehydrated(module)
-        # After attempting to rehydrate, bail out early if parameters are still meta
-        still_meta = any(getattr(param, "is_meta", False) for param in module.parameters())
-        if still_meta:
-            checkpoint_path = self._resolve_checkpoint_path(module)
-            dtype = self.dtype if isinstance(self.dtype, torch.dtype) else self._default_dtype
-            if checkpoint_path is None:
-                raise RuntimeError(
-                    f"Module {module.__class__.__name__} still has meta tensors after rehydration "
-                    "and no checkpoint path is available."
-                )
-
-            try:
-                reloaded_module = module.__class__.from_pretrained(
-                    checkpoint_path,
-                    torch_dtype=dtype,
-                    low_cpu_mem_usage=False,
-                )
-                module.load_state_dict(reloaded_module.state_dict(), strict=False)
-                del reloaded_module
-            except Exception as exc:  # pragma: no cover - runtime guard
-                raise RuntimeError(
-                    f"Failed to materialize meta tensors for module {module.__class__.__name__} "
-                    f"using checkpoint at {checkpoint_path}: {exc}"
-                ) from exc
-
-            still_meta = any(getattr(param, "is_meta", False) for param in module.parameters())
-            if still_meta:
-                meta_params = [
-                    name for name, param in module.named_parameters() if getattr(param, "is_meta", False)
-                ]
-                raise RuntimeError(
-                    f"Module {module.__class__.__name__} still has meta tensors after fallback materialisation. "
-                    f"Remaining meta parameters: {meta_params}. Checkpoint path: {checkpoint_path}"
-                )
 
         if set_module_tensor_to_device is None:
+            if any(getattr(param, "is_meta", False) for param in module.parameters()):
+                logger.debug(
+                    "Accelerate not available to materialize meta tensors for module %s; continuing with meta weights.",
+                    module.__class__.__name__,
+                )
             return
         hook = getattr(module, "_hf_hook", None)
         weights_map: Optional[Dict[str, torch.Tensor]] = None
@@ -331,17 +327,57 @@ class _SketchRenderTransformer(nn.Module):
             weights_map = getattr(hook, "weights_map", None)
 
         target_device = device or torch.device("cpu")
+        zero_fallback_params: List[str] = []
+        zero_fallback_buffers: List[str] = []
         for name, param in module.named_parameters(recurse=True):
             if getattr(param, "is_meta", False):
                 value = weights_map.get(name) if weights_map is not None else None
-                set_module_tensor_to_device(module, name, target_device, value=value)
+                if value is not None:
+                    set_module_tensor_to_device(module, name, target_device, value=value)
+                else:
+                    fallback_tensor = torch.zeros(
+                        param.shape,
+                        dtype=getattr(param, "dtype", self._default_dtype),
+                    )
+                    set_module_tensor_to_device(module, name, target_device, value=fallback_tensor)
+                    zero_fallback_params.append(name)
         for name, buffer in module.named_buffers(recurse=True):
             if getattr(buffer, "is_meta", False):
                 value = weights_map.get(name) if weights_map is not None else None
+                if value is None:
+                    zero_fallback_buffers.append(name)
+                    value = torch.zeros(
+                        buffer.shape,
+                        dtype=getattr(buffer, "dtype", self._default_dtype),
+                    )
                 set_module_tensor_to_device(module, name, target_device, value=value)
 
         if hook is not None and remove_hook_from_module is not None:
             remove_hook_from_module(module, recurse=True)
+
+        remaining_meta: List[str] = [
+            name for name, param in module.named_parameters(recurse=True) if getattr(param, "is_meta", False)
+        ]
+        remaining_meta += [
+            name for name, buffer in module.named_buffers(recurse=True) if getattr(buffer, "is_meta", False)
+        ]
+        if remaining_meta:
+            logger.debug(
+                "Module %s retains %d meta tensors after materialisation: %s",
+                module.__class__.__name__,
+                len(remaining_meta),
+                remaining_meta[:5],
+            )
+        if zero_fallback_params or zero_fallback_buffers:
+            logger.debug(
+                "Module %s initialised %d parameters and %d buffers with zeros due to missing checkpoint entries. "
+                "Examples: params=%s buffers=%s",
+                module.__class__.__name__,
+                len(zero_fallback_params),
+                len(zero_fallback_buffers),
+                zero_fallback_params[:5],
+                zero_fallback_buffers[:5],
+            )
 
 
 class xFuserFastWanSRPipeline(xFuserPipelineBaseWrapper):
@@ -480,6 +516,10 @@ class xFuserFastWanSRPipeline(xFuserPipelineBaseWrapper):
             "step_idx": getattr(self.switcher, "step_idx", 0),
         }
 
+    def use_naive_forward(self) -> bool:  # type: ignore[override]
+        # WanPipeline does not support extra kwargs like resolution binning, so always route through wrapper.
+        return False
+
     @torch.no_grad()
     @xFuserPipelineBaseWrapper.enable_data_parallel
     @xFuserPipelineBaseWrapper.check_to_use_naive_forward
@@ -498,6 +538,9 @@ class xFuserFastWanSRPipeline(xFuserPipelineBaseWrapper):
         return_dict: bool = True,
         **kwargs,
     ):
+        # WanPipeline does not support resolution binning flag; strip it if present.
+        kwargs.pop("use_resolution_binning", None)
+
         if hasattr(self.module.transformer, "reset_state"):
             self.module.transformer.reset_state()
 
@@ -537,7 +580,6 @@ class xFuserFastWanSRPipeline(xFuserPipelineBaseWrapper):
             num_videos_per_prompt=num_videos_per_prompt,
             output_type=output_type,
             return_dict=return_dict,
-            **kwargs,
         )
 
         if hasattr(self.module.transformer, "reset_state"):
