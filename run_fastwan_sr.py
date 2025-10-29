@@ -45,8 +45,15 @@ def _save_output(result: Any, output_path: str) -> None:
     if "images" in data and data["images"]:
         image = data["images"][0]
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        image.save(output_path)
-        print(f"Saved image to {output_path}")
+        if hasattr(image, "save"):
+            image.save(output_path)
+            print(f"Saved image to {output_path}")
+        elif isinstance(image, torch.Tensor):
+            tensor_path = f"{os.path.splitext(output_path)[0]}_image.pt"
+            torch.save(image, tensor_path)
+            print(f"Image tensor saved to {tensor_path} (convert or decode manually).")
+        else:
+            print("Image output type not recognised; nothing saved.")
         return
 
     if "frames" in data and data["frames"]:

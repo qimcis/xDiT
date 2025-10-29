@@ -3,6 +3,8 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import os
+import tempfile
 from typing import List, Optional
 
 import torch
@@ -232,6 +234,23 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment"
         )
+        if distributed_init_method == "env://":
+            env_rank = os.environ.get("RANK")
+            env_world_size = os.environ.get("WORLD_SIZE")
+            if env_rank is None or env_world_size is None:
+                tmp_store = tempfile.NamedTemporaryFile(prefix="xdit_dist_", delete=False)
+                tmp_store.close()
+                distributed_init_method = f"file://{tmp_store.name}"
+                world_size = 1
+                rank = 0
+                local_rank = 0
+                os.environ.setdefault("RANK", "0")
+                os.environ.setdefault("WORLD_SIZE", "1")
+                os.environ.setdefault("LOCAL_RANK", "0")
+                logger.info(
+                    "Environment variables for distributed launch not found. "
+                    "Falling back to single-process distributed setup."
+                )
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,

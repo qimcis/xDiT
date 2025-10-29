@@ -8,6 +8,11 @@ import torch.nn as nn
 from diffusers import DiffusionPipeline
 
 from xfuser.config import EngineConfig, InputConfig
+from xfuser.core.distributed import (
+    get_dit_group,
+    get_dit_world_size,
+    model_parallel_is_initialized,
+)
 from xfuser.logger import init_logger
 from xfuser.model_executor.pipelines import xFuserPipelineBaseWrapper
 from .register import xFuserPipelineWrapperRegister
@@ -34,8 +39,17 @@ def _gather_mean(value: torch.Tensor) -> torch.Tensor:
     if not dist.is_available() or not dist.is_initialized():
         return value
     value = value.clone()
-    dist.all_reduce(value, op=dist.ReduceOp.SUM)
-    value /= dist.get_world_size()
+    group = dist.group.WORLD
+    world_size = dist.get_world_size()
+    if model_parallel_is_initialized():
+        try:
+            group = get_dit_group()
+            world_size = get_dit_world_size()
+        except AssertionError:
+            group = dist.group.WORLD
+            world_size = dist.get_world_size()
+    dist.all_reduce(value, op=dist.ReduceOp.SUM, group=group)
+    value /= world_size
     return value
 
 
@@ -61,6 +75,7 @@ class _SketchRenderTransformer(nn.Module):
         self.step_idx = 0
         self.prev_output: Optional[torch.Tensor] = None
         self.prev_diff: Optional[torch.Tensor] = None
+        self._last_device: Optional[torch.device] = None
 
         # expose common attributes used by diffusers pipelines
         for attr in ["config", "dtype", "device"]:
@@ -68,6 +83,10 @@ class _SketchRenderTransformer(nn.Module):
                 setattr(self, attr, getattr(self.sketch_model, attr))
 
     def reset_state(self):
+        if self.config.render_offload:
+            device = self._last_device or self._get_module_device(self.render_model)
+            if device is not None and device.type != "cpu":
+                self.sketch_model.to(device)
         self.active_model = self.sketch_model
         self.switched = False
         self.step_idx = 0
@@ -79,6 +98,13 @@ class _SketchRenderTransformer(nn.Module):
         if not self.config.lazy_move_render or self.switched:
             self.render_model.to(*args, **kwargs)
         super().to(*args, **kwargs)
+        target_device = kwargs.get("device", None)
+        if target_device is None and args:
+            target_device = args[0]
+        if isinstance(target_device, torch.device):
+            self._last_device = target_device
+        else:
+            self._last_device = self._get_module_device(self.sketch_model)
         return self
 
     def _compute_self_diff(self, current: torch.Tensor) -> Optional[torch.Tensor]:
@@ -106,6 +132,7 @@ class _SketchRenderTransformer(nn.Module):
             self.render_model.to(device)
         self.active_model = self.render_model
         self.switched = True
+        self._last_device = device
 
         if self.config.render_offload:
             self.sketch_model.to("cpu")
@@ -131,6 +158,8 @@ class _SketchRenderTransformer(nn.Module):
             _ = self._compute_self_diff(current.detach())
 
         self.prev_output = current.detach()
+        if hasattr(current, "device"):
+            self._last_device = current.device
         self.step_idx += 1
         return outputs
 
@@ -138,6 +167,16 @@ class _SketchRenderTransformer(nn.Module):
         for model in (self.sketch_model, self.render_model):
             if hasattr(model, "reset_activation_cache"):
                 model.reset_activation_cache()
+
+    @staticmethod
+    def _get_module_device(module: nn.Module) -> Optional[torch.device]:
+        try:
+            return next(module.parameters()).device
+        except StopIteration:
+            pass
+        for buffer in module.buffers():
+            return buffer.device
+        return getattr(module, "device", None)
 
 
 class xFuserFastWanSRPipeline(xFuserPipelineBaseWrapper):
