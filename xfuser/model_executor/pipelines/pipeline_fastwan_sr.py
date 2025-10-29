@@ -1,7 +1,8 @@
 import os
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,11 @@ except ImportError:  # pragma: no cover - accelerate is expected in runtime but 
     set_module_tensor_to_device = None  # type: ignore[assignment]
     load_checkpoint_in_model = None  # type: ignore[assignment]
     remove_hook_from_module = None  # type: ignore[assignment]
+
+try:
+    from safetensors.torch import load_file
+except ImportError:  # pragma: no cover - safetensors should be available but guard anyway
+    load_file = None  # type: ignore[assignment]
 
 from xfuser.core.distributed import (
     get_dit_group,
@@ -45,6 +51,139 @@ class SketchRenderConfig:
     max_switch_step: int = 30
     render_offload: bool = False
     lazy_move_render: bool = True
+
+
+def _resolve_transformer_checkpoint_dir(
+    root: Optional[Union[str, os.PathLike]]
+) -> Optional[Path]:
+    if root is None:
+        return None
+
+    candidate = Path(root)
+    if not candidate.exists():
+        return None
+
+    if candidate.is_file():
+        candidate = candidate.parent
+
+    # Direct transformer folder already?
+    config_path = candidate / "config.json"
+    shard_exists = any(candidate.glob("diffusion_pytorch_model*.safetensors"))
+    if config_path.is_file() and shard_exists:
+        return candidate
+
+    # Maybe we're pointed at the pipeline root.
+    transformer_dir = candidate / "transformer"
+    if transformer_dir.is_dir():
+        return _resolve_transformer_checkpoint_dir(transformer_dir)
+
+    return None
+
+
+def _load_bias_tensors_for_wan(
+    checkpoint_dir: Path,
+    num_layers: int,
+) -> Optional[Dict[str, torch.Tensor]]:
+    if load_file is None:
+        logger.debug("safetensors unavailable; skipping Wan bias reload.")
+        return None
+
+    required_map: Dict[str, str] = {}
+    for idx in range(num_layers):
+        required_map.update(
+            {
+                f"blocks.{idx}.attn1.to_q.bias": f"blocks.{idx}.to_q.bias",
+                f"blocks.{idx}.attn1.to_k.bias": f"blocks.{idx}.to_k.bias",
+                f"blocks.{idx}.attn1.to_v.bias": f"blocks.{idx}.to_v.bias",
+                f"blocks.{idx}.attn1.to_out.0.bias": f"blocks.{idx}.to_out.bias",
+                f"blocks.{idx}.attn2.to_out.0.bias": f"blocks.{idx}.attn2.to_out.bias",
+                f"blocks.{idx}.ffn.net.0.proj.bias": f"blocks.{idx}.ffn.fc_in.bias",
+                f"blocks.{idx}.ffn.net.2.bias": f"blocks.{idx}.ffn.fc_out.bias",
+            }
+        )
+
+    collected: Dict[str, torch.Tensor] = {}
+    shard_paths = sorted(checkpoint_dir.glob("diffusion_pytorch_model*.safetensors"))
+    for shard_path in shard_paths:
+        shard_tensors = load_file(str(shard_path))
+        for dest, src in required_map.items():
+            if dest in collected:
+                continue
+            tensor = shard_tensors.get(src)
+            if tensor is not None:
+                collected[dest] = tensor
+        # free tensors eagerly before loading next shard
+        del shard_tensors
+        if len(collected) == len(required_map):
+            break
+
+    return collected
+
+
+def _restore_wan_biases(
+    module: nn.Module,
+    checkpoint_root: Optional[Union[str, os.PathLike]],
+) -> Tuple[List[str], List[str]]:
+    checkpoint_dir = _resolve_transformer_checkpoint_dir(checkpoint_root)
+    if checkpoint_dir is None:
+        logger.debug(
+            "Unable to locate transformer checkpoint under %s; skipping Wan bias fix.",
+            checkpoint_root,
+        )
+        return [], []
+
+    num_layers = getattr(getattr(module, "config", None), "num_layers", None)
+    if num_layers is None:
+        logger.debug("Transformer %s has no num_layers config; skipping bias fix.", module.__class__.__name__)
+        return [], []
+
+    bias_tensors = _load_bias_tensors_for_wan(checkpoint_dir, num_layers)
+    if bias_tensors is None:
+        return [], []
+
+    param_map = dict(module.named_parameters())
+    updated: List[str] = []
+    missing: List[str] = []
+
+    with torch.no_grad():
+        for name, value in bias_tensors.items():
+            param = param_map.get(name)
+            if param is None:
+                continue
+            if param.data.shape != value.shape:
+                try:
+                    value = value.reshape_as(param.data)
+                except RuntimeError:
+                    logger.debug(
+                        "Shape mismatch for %s: param %s vs checkpoint %s; skipping assignment.",
+                        name,
+                        tuple(param.data.shape),
+                        tuple(value.shape),
+                    )
+                    continue
+            param.copy_(value.to(param.dtype))
+            updated.append(name)
+
+        # Zero-out any remaining biases that still carry random init.
+        for idx in range(num_layers):
+            for suffix in (
+                "attn1.to_q.bias",
+                "attn1.to_k.bias",
+                "attn1.to_v.bias",
+                "attn1.to_out.0.bias",
+                "attn2.to_out.0.bias",
+                "ffn.net.0.proj.bias",
+                "ffn.net.2.bias",
+            ):
+                name = f"blocks.{idx}.{suffix}"
+                if name in updated or name not in param_map:
+                    continue
+                param = param_map[name]
+                if torch.count_nonzero(param.data).item() != 0:
+                    param.zero_()
+                    missing.append(name)
+
+    return updated, missing
 
 
 def _gather_mean(value: torch.Tensor) -> torch.Tensor:
@@ -424,10 +563,41 @@ class xFuserFastWanSRPipeline(xFuserPipelineBaseWrapper):
             trust_remote_code=engine_config.model_config.trust_remote_code,
             **kwargs,
         )
+
+        sketch_checkpoint_root = getattr(
+            getattr(pipeline.transformer, "config", None),
+            "_name_or_path",
+            pretrained_model_name_or_path,
+        )
+        updated_biases, missing_biases = _restore_wan_biases(pipeline.transformer, sketch_checkpoint_root)
+        if updated_biases:
+            logger.debug(
+                "Restored %d FastWan sketch biases from %s.",
+                len(updated_biases),
+                sketch_checkpoint_root,
+            )
+        if missing_biases:
+            logger.debug(
+                "Wan sketch checkpoint %s omitted %d bias tensors; zero-initialised for stability.",
+                sketch_checkpoint_root,
+                len(missing_biases),
+            )
+
+        target_dtype = kwargs.get("torch_dtype", None)
+        if target_dtype is not None:
+            try:
+                pipeline.transformer.to(dtype=target_dtype)
+            except Exception as exc:  # pragma: no cover - runtime guard
+                logger.warning(
+                    "Failed to cast FastWan sketch transformer to dtype %s: %s",
+                    target_dtype,
+                    exc,
+                )
+
         if return_org_pipeline:
             return pipeline
 
-        torch_dtype = kwargs.get("torch_dtype", None)
+        torch_dtype = target_dtype
 
         if not os.path.isdir(rendering_model_path):
             raise ValueError(f"Rendering model path {rendering_model_path} does not exist.")
@@ -459,8 +629,18 @@ class xFuserFastWanSRPipeline(xFuserPipelineBaseWrapper):
         sketch_model = self.module.transformer
 
         render_transformer = self._raw_render_transformer
-        target_dtype = next(sketch_model.parameters()).dtype
-        render_transformer.to(dtype=target_dtype)
+        runtime_dtype = getattr(engine_config.runtime_config, "dtype", None)
+        if runtime_dtype is None:
+            runtime_dtype = next(sketch_model.parameters()).dtype
+
+        try:
+            sketch_model.to(dtype=runtime_dtype)
+        except Exception as exc:  # pragma: no cover - runtime guard
+            logger.warning("Failed to cast FastWan sketch model to dtype %s: %s", runtime_dtype, exc)
+        try:
+            render_transformer.to(dtype=runtime_dtype)
+        except Exception as exc:  # pragma: no cover - runtime guard
+            logger.warning("Failed to cast FastWan render model to dtype %s: %s", runtime_dtype, exc)
 
         sketch_checkpoint_dir = getattr(sketch_model, "config", None)
         if sketch_checkpoint_dir is not None:
@@ -476,6 +656,24 @@ class xFuserFastWanSRPipeline(xFuserPipelineBaseWrapper):
         if self._sr_config.rendering_model_path and os.path.isdir(self._sr_config.rendering_model_path):
             candidate = os.path.join(self._sr_config.rendering_model_path, "transformer")
             render_checkpoint_dir = candidate if os.path.isdir(candidate) else self._sr_config.rendering_model_path
+
+        if render_checkpoint_dir:
+            updated_render_biases, missing_render_biases = _restore_wan_biases(
+                render_transformer,
+                render_checkpoint_dir,
+            )
+            if updated_render_biases:
+                logger.debug(
+                    "Restored %d FastWan render biases from %s.",
+                    len(updated_render_biases),
+                    render_checkpoint_dir,
+                )
+            if missing_render_biases:
+                logger.debug(
+                    "Wan render checkpoint %s omitted %d bias tensors; zero-initialised for stability.",
+                    render_checkpoint_dir,
+                    len(missing_render_biases),
+                )
 
         render_transformer = self._convert_transformer_backbone(
             render_transformer,
